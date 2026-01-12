@@ -238,6 +238,13 @@ def train_probes(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        device = torch.device("cpu")
+    use_cuda = device.type == "cuda"
+    num_gpus = torch.cuda.device_count() if use_cuda else 0
+    if num_gpus > 1:
+        device = torch.device("cuda:0")
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -264,6 +271,9 @@ def main() -> None:
     )
 
     model = ViTEncoder(args.backbone, args.img_size, args.proj_dim).to(device)
+    if num_gpus > 1:
+        print(f"Using {num_gpus} GPUs with DataParallel")
+        model = nn.DataParallel(model)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     warmup_steps = max(1, len(train_loader))
@@ -292,7 +302,8 @@ def main() -> None:
         summary = " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
         print(f"Epoch {epoch + 1}/{args.epochs}: {summary}")
 
-    torch.save(model.state_dict(), save_dir / "lejepa_encoder.pt")
+    state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    torch.save(state_dict, save_dir / "lejepa_encoder.pt")
 
     probe_train_ds = IDGBenchmarkDataset(
         root=args.data_root,
