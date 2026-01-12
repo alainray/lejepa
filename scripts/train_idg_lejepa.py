@@ -64,7 +64,7 @@ class ViTEncoder(nn.Module):
             drop_path_rate=0.1,
             img_size=img_size,
         )
-        self.proj = MLP(512, [2048, 2048, proj_dim], norm_layer=nn.BatchNorm1d)
+        self.proj = MLP(512, [2048, 2048, proj_dim], norm_layer=None)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         n, v = x.shape[:2]
