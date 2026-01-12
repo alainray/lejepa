@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import random
+import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import numpy as np
 import timm
 import torch
 import torch.nn as nn
@@ -18,6 +23,12 @@ from torchvision.transforms import v2
 from tqdm import tqdm
 
 from dataset import IDGBenchmarkDataset, IDGDatasetName, IDGSplitName
+
+warnings.filterwarnings(
+    "ignore",
+    message="The epoch parameter in `scheduler.step\\(\\)` was not necessary",
+    category=UserWarning,
+)
 
 
 class SICReg(nn.Module):
@@ -113,6 +124,34 @@ def build_transforms(img_size: int, train: bool) -> v2.Compose:
     return v2.Compose([v2.Resize(img_size), v2.CenterCrop(img_size)])
 
 
+def seed_worker(worker_id: int, base_seed: int) -> None:
+    seed = base_seed + worker_id
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+class JsonlLogger:
+    def __init__(self, path: Path, base_fields: Dict[str, object]) -> None:
+        self.path = path
+        self.base_fields = base_fields
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(self, **fields: object) -> None:
+        payload = {"timestamp": time.time(), **self.base_fields, **fields}
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Entrenamiento LeJEPA en MPI3D / dSprites")
     parser.add_argument("--data-root", type=str, required=True)
@@ -135,6 +174,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-weight-decay", type=float, default=1e-6)
     parser.add_argument("--probe-batch-size", type=int, default=256)
     parser.add_argument("--save-dir", type=str, default="outputs/lejepa_idg")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--method", type=str, default="LeJEPA")
     return parser.parse_args()
 
 
@@ -201,10 +242,12 @@ def train_probes(
     probes = nn.ModuleList([nn.Linear(input_dim, n) for n in factor_dims]).to(device)
     optimizer = torch.optim.AdamW(probes.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+    history = []
     for epoch in range(cfg.epochs):
         probes.train()
         progress = tqdm(train_loader, desc=f"Probes {epoch + 1}/{cfg.epochs}", leave=False)
         total_loss = 0.0
+        factor_loss = [0.0 for _ in factor_dims]
         for imgs, latents, _ in progress:
             imgs = imgs.to(device, non_blocking=True)
             latents = latents.to(device, non_blocking=True)
@@ -217,7 +260,14 @@ def train_probes(
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            for i, item in enumerate(losses):
+                factor_loss[i] += item.item()
             progress.set_postfix(loss=total_loss / (progress.n + 1))
+        steps = max(1, len(train_loader))
+        epoch_metrics = {"loss_total": total_loss / steps}
+        for i, value in enumerate(factor_loss):
+            epoch_metrics[f"loss_factor_{i}"] = value / steps
+        history.append(epoch_metrics)
 
     probes.eval()
     correct = [0 for _ in factor_dims]
@@ -232,11 +282,13 @@ def train_probes(
                 correct[i] += (pred == latents[:, i]).sum().item()
             total += latents.size(0)
 
-    return {f"factor_{i}": correct[i] / total for i in range(len(factor_dims))}
+    test_accs = {f"factor_{i}": correct[i] / total for i in range(len(factor_dims))}
+    return {"train_history": history, "test_accs": test_accs}
 
 
 def main() -> None:
     args = parse_args()
+    set_seed(args.seed)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU")
@@ -247,9 +299,43 @@ def main() -> None:
         device = torch.device("cuda:0")
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    log_path = save_dir / "metrics.jsonl"
+    hparams = {
+        "data_root": args.data_root,
+        "dataset": args.dataset,
+        "split": args.split,
+        "backbone": args.backbone,
+        "img_size": args.img_size,
+        "proj_dim": args.proj_dim,
+        "views": args.views,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "lamb": args.lamb,
+        "num_workers": args.num_workers,
+        "amp": args.amp,
+        "probe_epochs": args.probe_epochs,
+        "probe_lr": args.probe_lr,
+        "probe_weight_decay": args.probe_weight_decay,
+        "probe_batch_size": args.probe_batch_size,
+    }
+    logger = JsonlLogger(
+        log_path,
+        {
+            "method": args.method,
+            "seed": args.seed,
+            "model": args.backbone,
+            "hparams": hparams,
+        },
+    )
+    logger.log(event="config")
 
     train_transform = build_transforms(args.img_size, train=True)
     test_transform = build_transforms(args.img_size, train=False)
+
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(args.seed)
 
     train_ds = MultiViewIDGDataset(
         root=args.data_root,
@@ -268,6 +354,8 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
+        generator=loader_gen,
+        worker_init_fn=lambda worker_id: seed_worker(worker_id, args.seed),
     )
 
     model = ViTEncoder(args.backbone, args.img_size, args.proj_dim).to(device)
@@ -288,7 +376,9 @@ def main() -> None:
     )
     scaler = GradScaler(enabled=args.amp)
 
+    train_start = time.perf_counter()
     for epoch in range(args.epochs):
+        epoch_start = time.perf_counter()
         metrics = train_lejepa(
             model,
             train_loader,
@@ -299,8 +389,11 @@ def main() -> None:
             args.lamb,
             args.amp,
         )
+        epoch_time = time.perf_counter() - epoch_start
+        logger.log(event="train_epoch", epoch=epoch + 1, metrics=metrics, epoch_time_s=epoch_time)
         summary = " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
         print(f"Epoch {epoch + 1}/{args.epochs}: {summary}")
+    train_time = time.perf_counter() - train_start
 
     state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
     torch.save(state_dict, save_dir / "lejepa_encoder.pt")
@@ -331,6 +424,8 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
+        generator=loader_gen,
+        worker_init_fn=lambda worker_id: seed_worker(worker_id, args.seed),
     )
     probe_test_loader = DataLoader(
         probe_test_ds,
@@ -339,6 +434,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
+        worker_init_fn=lambda worker_id: seed_worker(worker_id, args.seed),
     )
 
     factor_dims = infer_factor_info(probe_train_ds)
@@ -348,7 +444,8 @@ def main() -> None:
         weight_decay=args.probe_weight_decay,
         batch_size=args.probe_batch_size,
     )
-    accs = train_probes(
+    probe_start = time.perf_counter()
+    probe_results = train_probes(
         model,
         probe_train_loader,
         probe_test_loader,
@@ -357,7 +454,32 @@ def main() -> None:
         probe_cfg,
         args.amp,
     )
-    for name, acc in accs.items():
+    probe_time = time.perf_counter() - probe_start
+    for epoch_idx, metrics in enumerate(probe_results["train_history"], start=1):
+        logger.log(event="probe_epoch", epoch=epoch_idx, metrics=metrics)
+    logger.log(event="probe_test", metrics=probe_results["test_accs"])
+    summary_payload = {
+        "train_time_s": train_time,
+        "probe_time_s": probe_time,
+        "train_epochs": args.epochs,
+        "probe_epochs": args.probe_epochs,
+        "probe_test": probe_results["test_accs"],
+    }
+    logger.log(event="run_summary", metrics=summary_payload)
+    with (save_dir / "summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "method": args.method,
+                "seed": args.seed,
+                "model": args.backbone,
+                "hparams": hparams,
+                **summary_payload,
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+    for name, acc in probe_results["test_accs"].items():
         print(f"Probe {name}: {acc:.4f}")
 
 
