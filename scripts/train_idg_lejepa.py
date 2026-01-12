@@ -297,7 +297,8 @@ def main() -> None:
     num_gpus = torch.cuda.device_count() if use_cuda else 0
     if num_gpus > 1:
         device = torch.device("cuda:0")
-    save_dir = Path(args.save_dir)
+    base_save_dir = Path(args.save_dir)
+    save_dir = base_save_dir / f"seed_{args.seed}"
     save_dir.mkdir(parents=True, exist_ok=True)
     log_path = save_dir / "metrics.jsonl"
     hparams = {
@@ -376,6 +377,7 @@ def main() -> None:
     )
     scaler = GradScaler(enabled=args.amp)
 
+    train_history: List[Dict[str, float]] = []
     train_start = time.perf_counter()
     for epoch in range(args.epochs):
         epoch_start = time.perf_counter()
@@ -391,6 +393,7 @@ def main() -> None:
         )
         epoch_time = time.perf_counter() - epoch_start
         logger.log(event="train_epoch", epoch=epoch + 1, metrics=metrics, epoch_time_s=epoch_time)
+        train_history.append({"epoch": epoch + 1, "epoch_time_s": epoch_time, **metrics})
         summary = " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
         print(f"Epoch {epoch + 1}/{args.epochs}: {summary}")
     train_time = time.perf_counter() - train_start
@@ -473,12 +476,15 @@ def main() -> None:
                 "seed": args.seed,
                 "model": args.backbone,
                 "hparams": hparams,
+                "train_history": train_history,
                 **summary_payload,
             },
             handle,
             ensure_ascii=False,
             indent=2,
         )
+    with (save_dir / "train_history.json").open("w", encoding="utf-8") as handle:
+        json.dump(train_history, handle, ensure_ascii=False, indent=2)
     for name, acc in probe_results["test_accs"].items():
         print(f"Probe {name}: {acc:.4f}")
 
