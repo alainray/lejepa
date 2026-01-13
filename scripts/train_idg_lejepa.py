@@ -218,14 +218,20 @@ def train_lejepa(
     return {k: v / steps for k, v in running.items()}
 
 
-def infer_factor_info(dataset: IDGBenchmarkDataset) -> List[int]:
-    labels = dataset._labels
-    if labels.ndim == 1:
-        labels = labels[:, None]
-    factors = []
-    for i in range(labels.shape[1]):
-        factors.append(int(labels[:, i].max()) + 1)
-    return factors
+def infer_factor_info(*datasets: IDGBenchmarkDataset) -> List[int]:
+    if not datasets:
+        raise ValueError("Se requiere al menos un dataset para inferir factores.")
+    max_labels = None
+    for dataset in datasets:
+        labels = dataset._labels
+        if labels.ndim == 1:
+            labels = labels[:, None]
+        dataset_max = labels.max(axis=0)
+        if max_labels is None:
+            max_labels = dataset_max
+        else:
+            max_labels = np.maximum(max_labels, dataset_max)
+    return [int(value) + 1 for value in max_labels]
 
 
 def train_probes(
@@ -440,7 +446,7 @@ def main() -> None:
         worker_init_fn=lambda worker_id: seed_worker(worker_id, args.seed),
     )
 
-    factor_dims = infer_factor_info(probe_train_ds)
+    factor_dims = infer_factor_info(probe_train_ds, probe_test_ds)
     probe_cfg = ProbeConfig(
         epochs=args.probe_epochs,
         lr=args.probe_lr,
